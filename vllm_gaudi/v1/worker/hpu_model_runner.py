@@ -579,6 +579,8 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
                                                                                input_ids.size(0), input_ids.size(1),
                                                                                input_ids.device, self.dtype,
                                                                                model_has_chunked_attention)
+            kwargs['attn_metadata'] = _pad_block_tensors_to_bucket(
+                kwargs['attn_metadata'])
         if self._rotary_prepare_cos_sin is not None:
             self._rotary_prepare_cos_sin(kwargs['positions'], recompute_cos_sin=self.recompute_cos_sin)
         attn_meta = kwargs.pop('attn_metadata', None)
@@ -634,6 +636,97 @@ def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
         *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
             *args, **kwargs)
+
+
+# Sorted list of block counts from decode warmup buckets.
+# Set by HPUModelRunner.warmup_model() so that _pad_block_tensors_to_bucket
+# can snap runtime block counts to a warmed-up size.
+_DECODE_BLOCK_BUCKETS: list[int] = []
+
+# Sorted list of max_context_len (in tokens) from prompt warmup buckets
+# for models with chunked attention.  Set by HPUModelRunner.warmup_model()
+# so that _snap_prefill_context_to_bucket can snap runtime context sizes
+# to shapes that were exercised during warmup.
+_PREFILL_CHUNKED_ATTN_BUCKETS: list[int] = []
+
+
+def _pad_block_tensors_to_bucket(attn_metadata):
+    """Pad block-dimension tensors to the nearest warmed-up bucket size.
+
+    During decode, tensors like block_mapping and attn_bias have dim-0
+    equal to the number of allocated KV-cache blocks, which varies per
+    request.  The HPU backend compiles with concrete shapes
+    (force_static_compile), so every unseen block count triggers an
+    expensive graph recompilation / HPUGraph capture.
+
+    This function pads the block dimension to the next size that was
+    already exercised during warmup, guaranteeing a cache hit.
+
+    Padding strategy (safe for pipelined_pa / flat_pa softmax):
+      * block_mapping rows = zeros  -> batch2block produces zero queries
+      * attn_bias rows    = -1e4   -> finite, so no NaN in softmax;
+        exp(-1e4 - group_max) ~ 0, so padded blocks contribute nothing
+      * 1-D tensors (block_list, block_groups, block_usage) = 0
+    """
+    if attn_metadata.is_prompt or not _DECODE_BLOCK_BUCKETS:
+        return attn_metadata
+
+    overrides: dict = {}
+    _FAMILIES = [
+        ('block_list',
+         ('block_list', 'block_usage', 'block_groups'),
+         (('block_mapping', 0.0), ('attn_bias', -1e4))),
+        ('window_block_list',
+         ('window_block_list', 'window_block_usage', 'window_block_groups'),
+         (('window_block_mapping', 0.0), ('window_attn_bias', -1e4))),
+        ('chunked_block_list',
+         ('chunked_block_list', 'chunked_block_usage', 'chunked_block_groups'),
+         (('chunked_block_mapping', 0.0), ('chunked_attn_bias', -1e4))),
+    ]
+    for ref_field, fields_1d, fields_2d in _FAMILIES:
+        ref = getattr(attn_metadata, ref_field, None)
+        if ref is None or not isinstance(ref, torch.Tensor) or ref.numel() == 0:
+            continue
+        n = ref.size(0)
+        target = _snap_to_bucket(n)
+        if target <= n:
+            continue
+        pad_n = target - n
+        for name in fields_1d:
+            t = getattr(attn_metadata, name, None)
+            if t is not None and isinstance(t, torch.Tensor):
+                overrides[name] = torch.nn.functional.pad(t, (0, pad_n))
+        for name, fill in fields_2d:
+            t = getattr(attn_metadata, name, None)
+            if t is not None and isinstance(t, torch.Tensor):
+                overrides[name] = torch.nn.functional.pad(
+                    t, (0, 0, 0, pad_n), value=fill)
+    if overrides:
+        return custom_tuple_replace(
+            attn_metadata, "TrimmedAttentionMetadata", **overrides)
+    return attn_metadata
+
+
+def _snap_to_bucket(n: int) -> int:
+    """Return the smallest decode block bucket >= *n*."""
+    import bisect
+    idx = bisect.bisect_left(_DECODE_BLOCK_BUCKETS, n)
+    if idx < len(_DECODE_BLOCK_BUCKETS):
+        return _DECODE_BLOCK_BUCKETS[idx]
+    # Beyond all warmup buckets — fall back to next power of 2
+    return 1 << (n - 1).bit_length() if n > 0 else 0
+
+
+def _snap_prefill_context_to_bucket(max_context_len: int) -> int:
+    """Return the smallest prefill chunked attn context bucket >= *max_context_len*."""
+    if not _PREFILL_CHUNKED_ATTN_BUCKETS:
+        return max_context_len
+    import bisect
+    idx = bisect.bisect_left(_PREFILL_CHUNKED_ATTN_BUCKETS, max_context_len)
+    if idx < len(_PREFILL_CHUNKED_ATTN_BUCKETS):
+        return _PREFILL_CHUNKED_ATTN_BUCKETS[idx]
+    # Beyond all warmup buckets — fall back to next power of 2.
+    return 1 << (max_context_len - 1).bit_length() if max_context_len > 0 else 0
 
 
 def subtuple(obj: object, typename: str, to_copy: list[str], to_override: Optional[dict[str, object]] = None):
@@ -4118,9 +4211,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         """
         Compile methods which are not part of the compiled model i.e. those
         which will not be compiled during model's compilation.
+
+        NOTE: metadata_processor.process_metadata is intentionally NOT
+        compiled because _snap_prefill_context_to_bucket (used for chunked
+        attention bias shape stabilisation) relies on bisect and a global
+        Python list, which torch.compile/dynamo cannot trace.
         """
         compiled_methods = [
-            'metadata_processor.process_metadata',
             '_rotary_prepare_cos_sin',
             'compute_logits',
         ]
@@ -4967,6 +5064,75 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.log_warmup_multimodal(phase, idx, len(candidates), candidates[idx] if is_batch_based else 1, 0,
                                            width, height)
 
+    def warmup_chunked_attention_graphs(self, kv_caches) -> None:
+        """Pre-compile additional chunked attention shapes.
+
+        For models with chunked attention (e.g. Llama-4 Maverick), the
+        chunked_attn_bias tensor shape depends on the number of context
+        blocks, which varies per request.  This warmup exercises
+        representative context block counts to pre-compile those shapes
+        and reduce first-run TTFT spikes.
+
+        Only called when VLLM_CHUNKED_ATTENTION_WARMUP=1.
+        """
+        if not self.model_has_chunked_attention:
+            return
+
+        prompt_buckets = self.bucketing_manager.prompt_buckets
+        if not prompt_buckets:
+            return
+
+        # Collect unique block counts from existing prompt buckets
+        existing_block_counts = sorted(set(b[2] for b in prompt_buckets))
+        max_blocks = max(existing_block_counts) if existing_block_counts else 0
+        if max_blocks == 0:
+            return
+
+        # Generate additional block counts (exponential progression)
+        extra_block_counts: set[int] = set()
+        b = 1
+        while b <= max_blocks:
+            extra_block_counts.add(b)
+            b *= 2
+        # Fill gaps with intermediate values
+        for blk_count in list(extra_block_counts):
+            mid = blk_count + blk_count // 2
+            if mid <= max_blocks:
+                extra_block_counts.add(mid)
+        # Remove counts already covered by existing prompt buckets
+        extra_block_counts -= set(existing_block_counts)
+        if not extra_block_counts:
+            return
+
+        # Pick a representative prompt config (smallest bs, smallest seq)
+        min_bs = min(b[0] for b in prompt_buckets)
+        min_seq = min(b[1] for b in prompt_buckets if b[0] == min_bs)
+
+        num_extra = 0
+        global _PREFILL_CHUNKED_ATTN_BUCKETS
+        for nblocks in sorted(extra_block_counts):
+            cfg = (min_bs, min_seq, nblocks)
+            graphed = (min_bs, min_seq, nblocks, True)
+            if graphed in self.graphed_buckets:
+                continue
+            self.graphed_buckets.add(graphed)
+            self._prepare_dummy_scenario(prompt_cfg=cfg, decode_cfg=None)
+            ctx_len = nblocks * self.block_size
+            if ctx_len not in _PREFILL_CHUNKED_ATTN_BUCKETS:
+                _PREFILL_CHUNKED_ATTN_BUCKETS.append(ctx_len)
+            num_extra += 1
+
+        _PREFILL_CHUNKED_ATTN_BUCKETS.sort()
+        if num_extra > 0:
+            logger.info(
+                "Chunked attention warmup: compiled %d extra shapes. "
+                "Updated prefill chunked attn buckets: %d entries, range [%d, %d]",
+                num_extra,
+                len(_PREFILL_CHUNKED_ATTN_BUCKETS),
+                _PREFILL_CHUNKED_ATTN_BUCKETS[0] if _PREFILL_CHUNKED_ATTN_BUCKETS else 0,
+                _PREFILL_CHUNKED_ATTN_BUCKETS[-1] if _PREFILL_CHUNKED_ATTN_BUCKETS else 0,
+            )
+
     @torch.inference_mode()
     def warmup_model(self) -> None:
         if not self.enable_bucketing:
@@ -4975,6 +5141,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.bucketing_manager.generate_prompt_buckets()
         if not self.is_pooling_model:
             self.bucketing_manager.generate_decode_buckets()
+            # Populate the module-level block bucket list so that
+            # _pad_block_tensors_to_bucket can snap runtime block counts
+            # to shapes that were exercised during warmup.
+            global _DECODE_BLOCK_BUCKETS
+            _DECODE_BLOCK_BUCKETS = sorted(
+                set(b[2] for b in self.bucketing_manager.decode_buckets
+                    if b[2] > 0))
+            logger.info("Decode block buckets for padding: %d entries, "
+                        "range [%d, %d]",
+                        len(_DECODE_BLOCK_BUCKETS),
+                        _DECODE_BLOCK_BUCKETS[0] if _DECODE_BLOCK_BUCKETS
+                        else 0,
+                        _DECODE_BLOCK_BUCKETS[-1] if _DECODE_BLOCK_BUCKETS
+                        else 0)
         else:
             self.bucketing_manager.decode_buckets = []
 
@@ -5063,6 +5243,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self.warmup_graphs(
                         self.bucketing_manager.prompt_buckets, True, kv_caches)
                 self.log_graph_warmup_summary(self.bucketing_manager.prompt_buckets, True, mem_post_prompt)
+                if self.model_has_chunked_attention:
+                    global _PREFILL_CHUNKED_ATTN_BUCKETS
+                    _PREFILL_CHUNKED_ATTN_BUCKETS = sorted(set(
+                        b[2] * self.block_size
+                        for b in self.bucketing_manager.prompt_buckets
+                        if b[2] > 0
+                    ))
+                    logger.info(
+                        "Prefill chunked attn context buckets: %d entries, "
+                        "range [%d, %d]",
+                        len(_PREFILL_CHUNKED_ATTN_BUCKETS),
+                        _PREFILL_CHUNKED_ATTN_BUCKETS[0] if _PREFILL_CHUNKED_ATTN_BUCKETS else 0,
+                        _PREFILL_CHUNKED_ATTN_BUCKETS[-1] if _PREFILL_CHUNKED_ATTN_BUCKETS else 0,
+                    )
+                    if get_config().chunked_attention_warmup:
+                        self.warmup_chunked_attention_graphs(kv_caches)
                 if not self.is_pooling_model:
                     mem_post_decode, decode_batch_seq, decode_captured_all = \
                       self.warmup_graphs(
@@ -6182,6 +6378,7 @@ class HPUAttentionMetadataProcessor:
             max_context_len = (block_list.size(-1) // batch_size if block_list is not None else 0)
             block_size = getattr(prefill_metadata, "block_size", self.block_size)
             max_context_len = max_context_len * block_size
+            max_context_len = _snap_prefill_context_to_bucket(max_context_len)
             query_positions = torch.arange(seq_len, device=device)
             total_token_positions = context_lens_t.unsqueeze(-1) + query_positions.unsqueeze(0)
             which_chunk = (total_token_positions // chunk_size)
