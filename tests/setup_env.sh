@@ -68,11 +68,21 @@ LOG="$SCRIPT_DIR/setup_env.log"
 : > "$LOG"
 echo "(also logging to $LOG)"
 
-# Colorized helpers
-step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; printf '==> %s\n' "$*" >> "$LOG"; }
-ok()   { printf '   \033[1;32mOK\033[0m %s\n' "$*"; printf '   OK %s\n' "$*" >> "$LOG"; }
-warn() { printf '   \033[1;33mWARN\033[0m %s\n' "$*"; printf '   WARN %s\n' "$*" >> "$LOG"; }
-die()  { printf '   \033[1;31mERR\033[0m %s\n' "$*" >&2; printf '   ERR %s\n' "$*" >> "$LOG"; exit 1; }
+# Enable colors only when stdout is a TTY (and NO_COLOR not set). This way
+# the on-disk log stays ANSI-free automatically and the terminal stays pretty.
+if [[ -t 1 && "${NO_COLOR:-}" != "1" ]]; then
+    C_STEP=$'\033[1;34m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'
+    C_ERR=$'\033[1;31m';  C_RST=$'\033[0m'
+else
+    C_STEP= C_OK= C_WARN= C_ERR= C_RST=
+fi
+
+# Each helper prints the colored line to stdout and a plain copy to $LOG so
+# `cat setup_env.log` is readable.
+step() { printf '\n%s==> %s%s\n' "$C_STEP" "$*" "$C_RST"; printf '==> %s\n' "$*" >> "$LOG"; }
+ok()   { printf '   %sOK%s %s\n'  "$C_OK"   "$C_RST" "$*"; printf '   OK %s\n'   "$*" >> "$LOG"; }
+warn() { printf '   %sWARN%s %s\n' "$C_WARN" "$C_RST" "$*"; printf '   WARN %s\n' "$*" >> "$LOG"; }
+die()  { printf '   %sERR%s %s\n'  "$C_ERR"  "$C_RST" "$*" >&2; printf '   ERR %s\n'  "$*" >> "$LOG"; exit 1; }
 
 echo "=== setup_env.sh started at $(date) ===" | tee -a "$LOG"
 
@@ -117,8 +127,6 @@ fi
 step "Check npu-stack repos (deepest → highest dependency layers)"
 # Layer 0–5 sources we depend on. Listed in topological order.
 REPOS_NEEDED=(
-    # Layer 0 — specs
-    specs_external
     # Layer 1 — synapse runtime
     synapse synapse_utils synapse_profiler hcl scal aeon
     # Layer 2 — TPC toolchain (tpc_scalar_kernels and engines_fw are
@@ -130,6 +138,9 @@ REPOS_NEEDED=(
     vllm vllm-gaudi
     # Layer 6 — tooling
     automation
+    # Note: specs_external is compile-time only (headers baked into synapse
+    # builds). It is documented in the layer diagram above but we don't check
+    # for it here because it is not needed for a runtime venv.
 )
 missing=()
 for r in "${REPOS_NEEDED[@]}"; do
@@ -211,12 +222,41 @@ for v in BUILD_ROOT BUILD_ROOT_LATEST GC_KERNEL_PATH TPC_COMPILER_PATH PYTORCH_M
 done
 [[ -f "$GC_KERNEL_PATH" ]] || die "GC_KERNEL_PATH points to missing file: $GC_KERNEL_PATH"
 ok "BUILD_ROOT_LATEST=$BUILD_ROOT_LATEST"
-ok "GC_KERNEL_PATH=$GC_KERNEL_PATH ($(du -h "$GC_KERNEL_PATH" | awk '{print $1}'))"
+# H1: du may fail on dangling symlinks or permission errors; make it safe.
+ok "GC_KERNEL_PATH=$GC_KERNEL_PATH ($(du -h "$GC_KERNEL_PATH" 2>/dev/null | awk '{print $1}' || echo '?'))"
 ok "PYTORCH_MODULES_ROOT_PATH=$PYTORCH_MODULES_ROOT_PATH"
 
 # ---------- 6. Helper funcs ----------------------------------------------
 have_py() { python -c "import $1" >/dev/null 2>&1; }
 pip_version() { python -c "import importlib.metadata as m; print(m.version('$1'))" 2>/dev/null || true; }
+
+# Install pip requirements from <file>, stripping lines that would clobber
+# our habana torch stack (torch / torchaudio / torchvision) or our pinned
+# pip/setuptools. Missing file → warn + continue. No `-q` and no `|| true`
+# on pip install: runtime-dep errors must be visible, not masked.
+install_reqs() {
+    local file="$1" label="$2"
+    if [[ ! -f "$file" ]]; then
+        warn "$label: requirements file not found at $file"
+        return 0
+    fi
+    local filtered
+    filtered="$(mktemp)"
+    # Keep lines that don't start with a conflicting package name followed by
+    # whitespace or a version operator. This preserves our habana torch and
+    # our already-pinned pip/setuptools.
+    grep -vE '^[[:space:]]*(torch|torchaudio|torchvision|pip|setuptools)[[:space:]=<>!]' \
+        "$file" > "$filtered" || true
+    local nlines
+    nlines="$(grep -cvE '^[[:space:]]*(#|$)' "$filtered" || true)"
+    if (( nlines > 0 )); then
+        python -m pip install -r "$filtered"
+        ok "$label: installed $nlines requirements from $(basename "$file")"
+    else
+        ok "$label: no requirements to install from $(basename "$file") (after filtering)"
+    fi
+    rm -f "$filtered"
+}
 
 # ---------- 7. Base tooling ----------------------------------------------
 step "Upgrade pip/wheel/setuptools"
@@ -224,28 +264,31 @@ step "Upgrade pip/wheel/setuptools"
 python -m pip install -q --upgrade pip wheel "setuptools<82"
 ok "pip=$(python -m pip --version | awk '{print $2}'), setuptools=$(pip_version setuptools), wheel=$(pip_version wheel)"
 
-step "Install base Python deps (numpy, symengine, etc.)"
-# symengine is required by pytorch-integration/python_packages/setup.py itself
-# (it imports it at install time for install_requires pinning).
-base_pkgs=(numpy symengine typing_extensions filelock sympy networkx jinja2 fsspec packaging pyyaml)
-for p in "${base_pkgs[@]}"; do
-    if [[ -n "$(pip_version "$p")" ]]; then
-        :  # already installed
-    else
-        python -m pip install -q "$p" || warn "failed to install $p"
-    fi
-done
-ok "base deps: numpy=$(pip_version numpy), symengine=$(pip_version symengine)"
+step "Install pytorch-integration build requirements"
+# PTI's requirements.txt has build-time deps (cmake, pybind11, numpy,
+# symengine, packaging, ...). symengine in particular is required by
+# python_packages/setup.py at import time for install_requires pinning.
+install_reqs "$PYTORCH_MODULES_ROOT_PATH/requirements.txt" "pytorch-integration"
+
+step "Install torch runtime-only deps (not covered by PTI req file)"
+# torch imports these at runtime. Listed explicitly rather than letting the
+# torch wheel resolve because we install torch with --no-deps (next step) to
+# keep pip from yanking habana-compatible pins.
+python -m pip install typing_extensions filelock sympy networkx jinja2 fsspec
+ok "torch runtime deps installed"
 
 # ---------- 8. torch+hpu from local wheel --------------------------------
+# H5: verify successful import, not just that metadata exists. `import torch`
+# can fail even when pip_version returns a string (corrupt wheel, broken
+# extension loader, etc.). M1: removed duplicated torch-deps pip install —
+# step 7 now installs them before torch.
 step "Install torch+hpu from $(basename "$TORCH_WHEEL")"
 current_torch="$(pip_version torch)"
-if [[ "$current_torch" == "$TORCH_FULL_VER"* ]]; then
-    ok "torch already installed: $current_torch"
+if [[ "$current_torch" == "$TORCH_FULL_VER"* ]] && have_py torch; then
+    ok "torch already installed and importable: $current_torch"
 else
     python -m pip install -q --no-deps "$TORCH_WHEEL"
-    # Install torch's own deps (the --no-deps above just keeps pip resolver happy)
-    python -m pip install -q typing_extensions filelock sympy networkx jinja2 fsspec packaging pyyaml 2>/dev/null || true
+    have_py torch || die "torch installed but `import torch` fails"
     ok "installed torch $(pip_version torch)"
 fi
 
@@ -274,10 +317,11 @@ export PT_WHEEL_VERS
 if (( htp_good )); then
     ok "habana-torch-plugin already editable: $current_htp"
 else
-    pushd "$PYTORCH_MODULES_ROOT_PATH/python_packages" >/dev/null
+    # H2: use a subshell (parens) instead of pushd/popd so that if pip fails
+    # we don't leave the caller's cwd pointing into python_packages/.
     mkdir -p "$PYTORCH_MODULES_WHL_BUILD_DIR"
-    python -m pip install -q --no-build-isolation --no-deps --force-reinstall -e .
-    popd >/dev/null
+    ( cd "$PYTORCH_MODULES_ROOT_PATH/python_packages" \
+      && python -m pip install -q --no-build-isolation --no-deps --force-reinstall -e . )
     ok "installed habana-torch-plugin $(pip_version habana-torch-plugin) (editable)"
 fi
 
@@ -297,19 +341,27 @@ if [[ -L "$HF_LIB_DIR" ]]; then
         ok "lib → $PYTORCH_MODULES_BUILD (relinked)"
     fi
 elif [[ -e "$HF_LIB_DIR" ]]; then
-    warn "$HF_LIB_DIR exists and is not a symlink — leaving alone"
+    # H3: a plain directory here would silently shadow our intended symlink.
+    # Fail loudly so the user can decide whether to delete it or keep.
+    die "$HF_LIB_DIR exists and is not a symlink. Expected a symlink to
+       $PYTORCH_MODULES_BUILD. Remove or rename it and re-run, or set
+       FORCE_REINSTALL=1 (venv rebuild does not touch this path)."
 else
     ln -sfn "$PYTORCH_MODULES_BUILD" "$HF_LIB_DIR"
     ok "lib → $PYTORCH_MODULES_BUILD"
 fi
-# fork_pybind subdir is where _*_C.py shims look for .so (same files, same dir)
-FORK_PYBIND_DIR="$HF_LIB_DIR/fork_pybind"
-# Since HF_LIB_DIR is a symlink to PYTORCH_MODULES_BUILD, fork_pybind must be
-# created *inside* that build dir. Use a second symlink pointing back to itself.
-if [[ -L "$PYTORCH_MODULES_BUILD/fork_pybind" ]]; then
+# fork_pybind subdir is where _*_C.py shims look for .so (same files, same
+# dir). Since HF_LIB_DIR is a symlink to PYTORCH_MODULES_BUILD, fork_pybind
+# must be created *inside* that build dir — a self-link pointing back to its
+# own parent so the shims can resolve `lib/fork_pybind/_*_C.so`.
+# H6: guard against a non-symlink entry already existing at that path.
+fp_path="$PYTORCH_MODULES_BUILD/fork_pybind"
+if [[ -L "$fp_path" ]]; then
     ok "fork_pybind symlink already present in build dir"
+elif [[ -e "$fp_path" ]]; then
+    die "$fp_path exists and is not a symlink (directory or file). Remove it and rerun."
 else
-    ln -sfn "$PYTORCH_MODULES_BUILD" "$PYTORCH_MODULES_BUILD/fork_pybind"
+    ln -sfn "$PYTORCH_MODULES_BUILD" "$fp_path"
     ok "fork_pybind → $PYTORCH_MODULES_BUILD (self-link)"
 fi
 
@@ -343,14 +395,14 @@ for pkg in habana-pyhlml habana-media-loader neural_compressor_pt; do
 done
 
 # ---------- 11. Verify HPU import ----------------------------------------
+# M2: Single cheap check — does habana_frameworks import + how many HPU
+# devices are visible. The full-stack smoke (vllm/vllm_gaudi/LLM) happens
+# at step 16 after those two are installed; duplicating here adds no value.
 step "Smoke-test habana_frameworks import"
-# Import must succeed; hpu device count may be 0 on a dev VM without Gaudi
-# hardware (we can still provision the venv and use it for code changes).
 if ! python - <<'PY'
 import habana_frameworks.torch  # noqa: F401
 import torch
-print(f'   torch {torch.__version__}')
-print(f'   hpu_count: {torch.hpu.device_count()}')
+print(f'   torch {torch.__version__}, hpu_count={torch.hpu.device_count()}')
 PY
 then
     warn "habana_frameworks import FAILED."
@@ -358,34 +410,53 @@ then
     warn "GC_KERNEL_PATH=${GC_KERNEL_PATH:-<unset>}"
     die "fix habana_frameworks provisioning before proceeding"
 fi
-if python -c "import torch; import habana_frameworks.torch; exit(0 if torch.hpu.device_count() > 0 else 1)" 2>/dev/null; then
+if python -c "import torch; exit(0 if torch.hpu.device_count() > 0 else 1)" 2>/dev/null; then
     ok "HPU backend responsive"
 else
     warn "HPU backend loaded but 0 devices visible (no Gaudi on this VM — OK for dev only)"
 fi
 
-# ---------- 12. vLLM editable (empty target — HPU backend comes from vllm_gaudi) -
-step "Install vllm (editable, VLLM_TARGET_DEVICE=empty)"
+# ---------- 12. vLLM runtime deps + editable install ---------------------
+# C1: install vllm's runtime deps from requirements/common.txt BEFORE the
+# editable install. Without this, pip leaves 40+ packages out and `import
+# vllm` only works until something lazy-loads aiohttp, openai, etc.
+step "Install vllm build + runtime requirements"
 VLLM_DIR="$NPU_STACK_ROOT/vllm"
-current_vllm="$(pip_version vllm)"
-if [[ -n "$current_vllm" ]] && python -c "import vllm; from vllm import LLM" 2>/dev/null; then
-    ok "vllm already editable: $current_vllm"
+[[ -d "$VLLM_DIR" ]] || die "vllm sources missing at $VLLM_DIR"
+# build.txt has setuptools-scm, cmake, ninja, build — required by vllm's
+# pyproject.toml hooks during editable install (prepare_metadata_for_build_editable).
+# common.txt has runtime deps (aiohttp, openai, transformers, fastapi, ...).
+# Both filtered to preserve our habana torch + pinned setuptools/pip.
+install_reqs "$VLLM_DIR/requirements/build.txt"  "vllm/build"
+install_reqs "$VLLM_DIR/requirements/common.txt" "vllm/common"
+
+step "Install vllm (editable, VLLM_TARGET_DEVICE=empty)"
+# Idempotency via the .pth file, not `pip show vllm`. `pip show` reports the
+# leftover dist-info from a previously failed editable install even after the
+# .pth is gone — we'd then skip re-install and the venv stays broken.
+# Similarly `have_py vllm` can pass via PYTHONPATH shadowing the source tree.
+vllm_pth="$(ls "$VENV_DIR/lib/python3.12/site-packages"/__editable__.vllm-*.pth 2>/dev/null | head -1)"
+if [[ -n "$vllm_pth" ]]; then
+    ok "vllm already editable: $(basename "$vllm_pth")"
 else
-    pushd "$VLLM_DIR" >/dev/null
-    # Install build requirements (minus torch — we already have habana torch)
-    python -m pip install -q -r <(sed '/^torch/d' requirements/build.txt) || true
-    VLLM_TARGET_DEVICE=empty python -m pip install -q --no-build-isolation -e .
-    popd >/dev/null
+    # H2: subshell instead of pushd/popd so cwd never leaks on failure.
+    # H4: no `|| true` — a build failure must surface, not be hidden.
+    ( cd "$VLLM_DIR" \
+      && VLLM_TARGET_DEVICE=empty python -m pip install --no-build-isolation -e . )
     ok "installed vllm $(pip_version vllm)"
 fi
 
-# ---------- 13. vllm-gaudi editable --------------------------------------
-step "Install vllm-gaudi (editable)"
+# ---------- 13. vllm-gaudi runtime deps + editable install ---------------
+step "Install vllm-gaudi runtime requirements"
 VLLM_GAUDI_DIR="$NPU_STACK_ROOT/vllm-gaudi"
-if [[ -n "$(pip_version vllm-gaudi)" ]]; then
+[[ -d "$VLLM_GAUDI_DIR" ]] || die "vllm-gaudi sources missing at $VLLM_GAUDI_DIR"
+install_reqs "$VLLM_GAUDI_DIR/requirements.txt" "vllm-gaudi"
+
+step "Install vllm-gaudi (editable)"
+if [[ -n "$(pip_version vllm-gaudi)" ]] && have_py vllm_gaudi; then
     ok "vllm-gaudi already: $(pip_version vllm-gaudi)"
 else
-    python -m pip install -q -e "$VLLM_GAUDI_DIR"
+    python -m pip install -e "$VLLM_GAUDI_DIR"
     ok "installed vllm-gaudi $(pip_version vllm-gaudi)"
 fi
 
@@ -435,7 +506,33 @@ print(f'   hpu count:  {torch.hpu.device_count()}')
 PY
 ok "all imports OK from $VENV_DIR"
 
-# ---------- 17. Summary --------------------------------------------------
+# ---------- 17. Component versions --------------------------------------
+# Print versions + git HEADs so a log captures the exact sources used.
+# Uses `git -C` to avoid changing cwd. Falls back to '?' on any failure.
+step "Component versions"
+git_head() { git -C "$1" rev-parse --short HEAD 2>/dev/null || echo '?'; }
+git_desc() { git -C "$1" describe --always --tags --dirty 2>/dev/null || echo '?'; }
+git_msg()  { git -C "$1" log -1 --pretty=%s 2>/dev/null | head -c 70 || echo '?'; }
+print_component() {
+    local name="$1" dir="$2" pkg="$3"
+    local ver head desc msg
+    ver="$(pip_version "$pkg")"
+    if [[ -d "$dir/.git" ]]; then
+        head="$(git_head "$dir")"
+        desc="$(git_desc "$dir")"
+        msg="$(git_msg "$dir")"
+        printf '   %-14s %-30s  git:%s  (%s)\n      └─ %s\n' \
+            "$name" "${ver:-<not installed>}" "$head" "$desc" "$msg"
+    else
+        printf '   %-14s %-30s  (no .git at %s)\n' "$name" "${ver:-<not installed>}" "$dir"
+    fi
+}
+print_component "vllm"          "$NPU_STACK_ROOT/vllm"                 vllm
+print_component "vllm-gaudi"    "$NPU_STACK_ROOT/vllm-gaudi"           vllm-gaudi
+print_component "pytorch-int."  "$PYTORCH_MODULES_ROOT_PATH"           habana-torch-plugin
+print_component "torch"         "$NPU_STACK_ROOT/pytorch-fork"         torch
+
+# ---------- 18. Summary --------------------------------------------------
 step "Summary"
 cat <<EOF
    Venv:        $VENV_DIR
