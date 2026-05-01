@@ -526,6 +526,18 @@ export FUSER_DEBUG_PATH="$FUSER_DEBUG_DIR"
 ok "VLLM_PROFILER_ENABLED=$VLLM_PROFILER_ENABLED, VLLM_PROFILE_PROMPT=$VLLM_PROFILE_PROMPT"
 ok "FUSER_DEBUG_DATA=1, FUSER_DEBUG_PATH=$FUSER_DEBUG_PATH"
 
+# Synapse IR graph dumps (pre/post optimization passes).
+# Controlled by DUMP_SYNAPSE_GRAPHS env var (default: off — large output).
+if [[ "${DUMP_SYNAPSE_GRAPHS:-}" == "1" ]]; then
+    SYNAPSE_GRAPH_DIR="$RUN_DIR/synapse_graphs"
+    mkdir -p "$SYNAPSE_GRAPH_DIR"
+    export ENABLE_EXPERIMENTAL_FLAGS=true
+    export GRAPH_VISUALIZATION=1
+    export DUMP_PRE_GRAPHS="$SYNAPSE_GRAPH_DIR"
+    export DUMP_POST_GRAPHS="$SYNAPSE_GRAPH_DIR"
+    ok "Synapse graph dumps: $SYNAPSE_GRAPH_DIR"
+fi
+
 # Clean stale $HABANA_LOGS so the snapshot we collect at exit contains ONLY
 # this run's framework output. Only touch paths under $HOME to avoid wiping
 # a shared system location by accident.
@@ -546,6 +558,8 @@ step "Launch inference at $(date)"
 info "MODEL=$MODEL"
 info "MAX_MODEL_LEN=$MAX_MODEL_LEN MAX_BATCHED_TOKENS=$MAX_BATCHED_TOKENS"
 info "TRACE_DIR=$TRACE_DIR"
+info "HABANA_LOGS=${HABANA_LOGS:-<not set>}"
+info "FUSER_DEBUG_PATH=$FUSER_DEBUG_PATH"
 
 # Time the whole inference so we report a wall-clock number even when the run
 # ends with vllm_gaudi's intentional `AssertionError: "Finished profiling"`
