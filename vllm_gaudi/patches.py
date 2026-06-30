@@ -27,6 +27,16 @@ Currently:
   is deferred to ``load_general_plugins`` time to avoid importing
   ``vllm.v1.sample.sampler`` during early plugin registration, which would
   trigger a heavy import chain that interferes with platform initialisation.
+
+* ``vllm.v1.sample.sampler.Sampler.gather_logprobs`` — upstream PR #38933
+  added two ``mark_unbacked()`` calls inside ``gather_logprobs`` to prevent
+  0->1 batch-size specialization recompiles for ``batched_count_greater_than``
+  on CUDA.  On HPU, ``torch._dynamo`` marks ``mark_unbacked`` as a forbidden
+  callable (``is_forbidden=True``), so tracing a compiled ``Sampler`` raises
+  ``AssertionError: Attempt to trace forbidden callable mark_unbacked`` for
+  any request with ``logprobs=true``.  We replace ``gather_logprobs`` with an
+  identical implementation that omits the two ``mark_unbacked`` calls.  HPU
+  handles dynamic batch shapes without this hint.
 """
 
 import gc
@@ -34,8 +44,27 @@ import gc
 import torch
 
 from vllm import envs
-from vllm.distributed import parallel_state
-from vllm.platforms import current_platform
+
+# NOTE: neither ``vllm.platforms.current_platform`` nor
+# ``vllm.distributed.parallel_state`` is imported at module top level — both
+# force re-entrant platform resolution *while this module is being imported by
+# ``vllm_gaudi.register()``*, leaving ``vllm_gaudi`` partially initialized so
+# the HPU platform plugin is silently dropped and vLLM falls back to
+# ``UnspecifiedPlatform`` ("RuntimeError: Failed to infer device type / Device
+# string must not be empty"). Concretely:
+#
+# * ``current_platform`` is a lazily-resolved attribute (see
+#   ``vllm/platforms/__init__.py.__getattr__``): importing it eagerly runs
+#   ``resolve_current_platform_cls_qualname()`` directly.
+# * ``parallel_state`` transitively imports ``vllm.utils.torch_utils``, whose
+#   module-level ``PIN_MEMORY = is_pin_memory_available()`` (vllm PR #45424)
+#   resolves ``current_platform`` at import time — the same re-entry, one hop
+#   removed.
+#
+# Both are therefore imported lazily inside the functions that use them, and
+# the ``cleanup_dist_env_and_memory`` patch (which needs ``parallel_state``)
+# is deferred to ``load_general_plugins`` time rather than ``apply()``
+# (platform-registration time). See GAUDISW-249622.
 
 
 def _hpu_accelerator_empty_cache() -> None:
@@ -46,6 +75,8 @@ def _hpu_accelerator_empty_cache() -> None:
     ``RuntimeError``.  Route through ``current_platform.empty_cache``
     instead (which is ``None`` on HPU, making this a no-op).
     """
+    from vllm.platforms import current_platform
+
     empty_cache = current_platform.empty_cache
     if empty_cache is not None:
         empty_cache()
@@ -122,6 +153,9 @@ def _hpu_cleanup_dist_env_and_memory(shutdown_ray: bool = False) -> None:
     ``torch.accelerator.empty_cache()`` (which is incompatible with the
     HPU allocator).
     """
+    from vllm.distributed import parallel_state
+    from vllm.platforms import current_platform
+
     # Re-apply lazy runtime patches that may depend on import timing.
     _patch_hf3fs_mock_client_for_cpu_only()
 
@@ -146,6 +180,58 @@ def _hpu_cleanup_dist_env_and_memory(shutdown_ray: bool = False) -> None:
             torch._C._host_emptyCache()
     except AttributeError:
         parallel_state.logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
+
+
+def _hpu_gather_logprobs(
+    logprobs: torch.Tensor,
+    num_logprobs: int,
+    token_ids: torch.Tensor,
+):
+    """HPU-safe replacement for ``Sampler.gather_logprobs``.
+
+    Identical logic to the upstream implementation (vllm PR #38933) but with
+    the two ``mark_unbacked()`` calls removed.  On HPU, ``mark_unbacked`` is a
+    forbidden callable in ``torch._dynamo`` (``is_forbidden=True``).  When the
+    compiled ``Sampler`` traces ``gather_logprobs``, hitting ``mark_unbacked``
+    raises ``AssertionError: Attempt to trace forbidden callable``.  HPU does
+    not need this CUDA-specific recompile hint.
+
+    Upstream ref: https://github.com/vllm-project/vllm/pull/38933
+    """
+    from vllm.v1.outputs import LogprobsTensors
+    import vllm.v1.sample.sampler as _sampler_mod
+
+    assert token_ids.dtype == torch.int64
+    topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+    token_ids = token_ids.unsqueeze(-1)
+    token_logprobs = logprobs.gather(-1, token_ids)
+    # mark_unbacked calls intentionally omitted — forbidden on HPU dynamo.
+    token_ranks = _sampler_mod.batched_count_greater_than(logprobs, token_logprobs)
+    indices = torch.cat((token_ids, topk_indices), dim=1)
+    logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+    indices = indices.to(torch.int32)
+    return LogprobsTensors(indices, logprobs, token_ranks)
+
+
+def _patch_gather_logprobs() -> None:
+    """Replace ``Sampler.gather_logprobs`` with the HPU-safe variant.
+
+    Called from the ``load_general_plugins`` hook (same as
+    ``_patch_batched_count_greater_than``) so that ``vllm.v1.sample.*``
+    imports run after platform initialisation.
+
+    Guarded by ``inspect.getsource`` so this is a no-op on vLLM versions
+    that predate PR #38933 (i.e. where ``gather_logprobs`` does not call
+    ``mark_unbacked``).
+    """
+    import inspect
+
+    import vllm.v1.sample.sampler as _sampler_mod
+
+    if 'mark_unbacked' not in inspect.getsource(_sampler_mod.Sampler.gather_logprobs):
+        return  # Not affected — older vLLM without PR #38933.
+
+    _sampler_mod.Sampler.gather_logprobs = staticmethod(_hpu_gather_logprobs)
 
 
 def _hpu_batched_count_greater_than(x: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -173,6 +259,22 @@ def _patch_batched_count_greater_than() -> None:
     _sampler_mod.batched_count_greater_than = _hpu_batched_count_greater_than
 
 
+def _patch_cleanup_dist_env_and_memory() -> None:
+    """Install the HPU-safe ``cleanup_dist_env_and_memory`` replacement.
+
+    Deferred to ``load_general_plugins`` time (rather than ``apply()`` at
+    platform-registration time) so the ``vllm.distributed.parallel_state``
+    import chain runs *after* the platform is initialised and *after*
+    ``vllm.utils.torch_utils`` has finished importing (see ``apply()`` and
+    the module-level NOTE — GAUDISW-249622).
+    """
+    from vllm.distributed import parallel_state
+    import vllm.distributed as _vllm_distributed
+
+    parallel_state.cleanup_dist_env_and_memory = _hpu_cleanup_dist_env_and_memory
+    _vllm_distributed.cleanup_dist_env_and_memory = _hpu_cleanup_dist_env_and_memory
+
+
 def apply() -> None:
     """Install all HPU runtime monkey-patches."""
     # --- torch.accelerator.empty_cache ---
@@ -182,26 +284,27 @@ def apply() -> None:
     if not hasattr(torch._C, "_host_emptyCache"):
         torch._C._host_emptyCache = lambda: None
 
-    # --- cleanup_dist_env_and_memory ---
-    parallel_state.cleanup_dist_env_and_memory = _hpu_cleanup_dist_env_and_memory
-    import vllm.distributed as _vllm_distributed
-
-    _vllm_distributed.cleanup_dist_env_and_memory = _hpu_cleanup_dist_env_and_memory
     _patch_hf3fs_mock_client_for_cpu_only()
 
-    # --- batched_count_greater_than (deferred) ---
-    # We cannot import the sampler modules here because the import chain
-    # triggers platform re-initialisation ("Device string must not be
-    # empty").  Instead we hook into ``load_general_plugins`` which runs
-    # in every process (parent + EngineCore subprocess) after the platform
-    # is ready.
+    # --- Deferred patches (cleanup_dist_env_and_memory + sampler) ---
+    # We cannot import ``vllm.distributed.parallel_state`` or the sampler
+    # modules here, at platform-registration time.  Their import chain
+    # re-enters ``vllm.utils.torch_utils`` while it is still initialising
+    # (vllm PR #45424 made ``PIN_MEMORY`` resolve the current platform at
+    # ``torch_utils`` import time, and that platform resolution is exactly
+    # what triggers this plugin's registration).  The re-entry aborts HPU
+    # platform detection ("Failed to infer device type").  Instead we hook
+    # into ``load_general_plugins`` which runs in every process (parent +
+    # EngineCore subprocess) after the platform is ready.
     import vllm.plugins as _plugins_mod
 
     _original_load_general = _plugins_mod.load_general_plugins
 
     def _load_general_with_hpu_patches():
         _original_load_general()
+        _patch_cleanup_dist_env_and_memory()
         _patch_batched_count_greater_than()
+        _patch_gather_logprobs()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 

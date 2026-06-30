@@ -48,7 +48,7 @@ from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_pa
 from vllm.distributed.kv_transfer import (get_kv_transfer_group, has_kv_transfer_group)
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.vocab_parallel_embedding import (VocabParallelEmbedding)
@@ -1338,10 +1338,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
 
             if num_indices < target_bs:
-                padding = torch.full((target_bs - num_indices, ),
-                                     self._MAMBA_PAD_BLOCK_ID,
-                                     dtype=torch.int32,
-                                     device='cpu')
+                pad_val = -1 if group_idx in self._compact_gdn_group_ids else self._MAMBA_PAD_BLOCK_ID
+                padding = torch.full((target_bs - num_indices, ), pad_val, dtype=torch.int32, device='cpu')
                 state_indices_cpu = torch.cat([state_indices_cpu, padding])
 
             all_state_indices_cpu.append(state_indices_cpu)
@@ -1425,7 +1423,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             device,
             model.embedding_modules,
         )
-        return self.lora_manager.create_lora_manager(model)
+        return self.lora_manager.create_lora_manager(model, vllm_config)
 
     def set_active_loras(self, lora_requests: set[LoRARequest], lora_mapping: LoRAMapping) -> None:
         if not self.lora_manager:
@@ -1465,7 +1463,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     logger.error("KV sharing validation failed for %s -> %s: %s", layer_name,
                                  kv_sharing_target_layer_name, e)
                 continue
-            if isinstance(attn_module, FusedMoE):
+            if isinstance(attn_module, MoERunner):
                 continue
 
             # TODO: Support other attention modules, e.g., sliding window,
@@ -4741,6 +4739,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 and runner._modules.get('gate', None) is block_gate):
                             del runner._modules['gate']
                             object.__setattr__(runner, 'gate', block_gate)
+                        # After upstream vLLM PR #41184, FusedMoE is a factory
+                        # that returns a MoERunner directly, so `mlp.experts`
+                        # *is* the MoERunner: there is no experts.runner child
+                        # and the shared gate is registered straight on
+                        # experts._modules['gate'] (not experts._gate). INC's
+                        # generate_model_info() then sees the gate under both
+                        # mlp and mlp.experts and (last-seen parent wins)
+                        # patches experts.gate, leaving mlp.gate as a stale
+                        # module whose weight is mutated in-place to fp8 -> the
+                        # unpatched mlp.gate(hs) forward hits a bf16/fp8 shape
+                        # mismatch. Detach the gate from the runner so INC
+                        # patches only the block-level mlp.gate;
+                        # _sync_shared_moe_gates() clears experts.gate after.
+                        elif (isinstance(experts, torch.nn.Module)
+                              and experts._modules.get('gate', None) is block_gate):
+                            del experts._modules['gate']
+                            object.__setattr__(experts, 'gate', block_gate)
+                            self._detached_moe_gates.add(id(experts))
 
     def _sync_shared_moe_gates(self):
         """Apply SharedFusedMoE post-INC synchronization and compatibility.
@@ -4778,10 +4794,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 # Force external router path: the model's forward checks
                 # experts.is_internal_router to decide the gate path.
-                if isinstance(experts, FusedMoE):
-                    # is_internal_router is a read-only property backed
-                    # by _gate; setting _gate=None makes it return False.
-                    experts._gate = None
+                if isinstance(experts, MoERunner):
+                    # is_internal_router is a read-only property backed by
+                    # the public `gate` attribute (returns gate is not None);
+                    # clearing gate makes it return False. Upstream #41184
+                    # inverted FusedMoE into a MoERunner factory, so the gate
+                    # now lives directly on the runner instead of `_gate`.
+                    experts.gate = None
                 else:
                     # INC wrappers (e.g. PatchedMixtralMoE) may inherit
                     # is_internal_router as a read-only @property;
@@ -4828,7 +4847,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 setattr(module, name, bool(getattr(moe_config, name, False)))
 
         for mod in self.model.modules():
-            if isinstance(mod, FusedMoE):
+            if isinstance(mod, MoERunner):
                 _sync_moe_kernel_flags(mod)
 
     def log_graph_warmup_summary(self, buckets, is_prompt, total_mem):
@@ -5242,6 +5261,41 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         if prompt_cfg:
             prompt_bs, prompt_query_len, prompt_num_blocks = prompt_cfg
+
+            # Granite 4.0-H (non-GDN mamba hybrid): self.block_size is 528
+            # (mamba page alignment). The prompt-warmup context is materialized
+            # as prompt_num_blocks * self.block_size KV tokens, so the largest
+            # long-context bucket (e.g. 249 blocks) would build a ~131K-token
+            # context and OOM at gpu_memory_util 0.9 during warmup. The compiled
+            # graph key is (bs, query_len, num_blocks) where num_blocks is the
+            # context-block COUNT, so we cap only the warmed block COUNT here;
+            # this bounds the warmup activation peak WITHOUT changing the 528
+            # kernel/bucketing/runtime semantics. Realistic tool-calling and
+            # humaneval requests carry only a short context (tool defs + query,
+            # far below this cap), so they still hit warmed buckets and incur no
+            # runtime "not warmed-up" recompilation; only requests approaching
+            # the 131K max capacity would. GDN hybrids and non-mamba models are
+            # untouched (block_size stays 128 there, so no oversized context).
+            if (self.num_mamba_like_layers > 0 and self.num_gdn == 0 and not self.is_pooling_model):
+                # ~33K tokens matches the historically OOM-safe short-context
+                # warmup peak (the short-ctx profile warms up to ~64 blocks of
+                # 528 ≈ 33K tokens at 0.9 without OOM).
+                warmup_ctx_token_cap = 33792
+                max_warmup_ctx_blocks = max(1, warmup_ctx_token_cap // self.block_size)
+                if prompt_num_blocks > max_warmup_ctx_blocks:
+                    # Emit once so a cold-start "Configuration was not
+                    # warmed-up" on a genuinely long-context request is
+                    # traceable back to this intentional warmup cap rather
+                    # than mistaken for a bucketing bug.
+                    logger.warning_once(
+                        "Capping non-GDN mamba-hybrid prompt warmup context "
+                        "from %s to %s blocks (block_size=%s, ~%s tokens) to "
+                        "bound the warmup activation peak. Requests whose "
+                        "prompt context exceeds ~%s tokens are not pre-warmed "
+                        "and may recompile once on first use.", prompt_num_blocks, max_warmup_ctx_blocks,
+                        self.block_size, max_warmup_ctx_blocks * self.block_size,
+                        max_warmup_ctx_blocks * self.block_size)
+                prompt_num_blocks = min(prompt_num_blocks, max_warmup_ctx_blocks)
 
             if self.is_pooling_model:
                 prompt_total_tokens = [prompt_query_len]
@@ -5914,19 +5968,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.is_encoder_only_attn = False
         self.may_add_encoder_only_layers_to_kv_cache_config()
         if self.num_mamba_like_layers > 0:
-            # NOTE: Do NOT reassign self.block_size or
-            # bucketing_manager.block_size from cache_config here.
-            # For hybrid models the upstream HybridAttentionMambaModelConfig
-            # inflates cache_config.block_size to align mamba pages (e.g.
-            # 1152 for Qwen3.5), but the HPU attention kernel operates at
-            # 128-token granularity.  _create_decode_input_data computes
-            # num_blocks using self.attn_block_size (set below from
-            # prepare_kernel_block_sizes), so the bucketing manager must
-            # also use that same granularity.  Overwriting block_size with
-            # the inflated KV-manager page size caused decode buckets to be
-            # generated at 1152-token granularity while runtime used
-            # 128-token granularity, leading to permanent "not warmed-up"
-            # warnings and recompilations.
+            if self.num_gdn == 0:
+                # Granite 4.0-H (non-GDN mamba hybrid): the platform inflates
+                # cache_config.block_size to 528 (no prefix caching) for mamba
+                # page alignment, and the attention kernel runs at that size.
+                # Align self.block_size and the bucketing manager to the same
+                # value so decode bucketing matches the kernel granularity.
+                # Without this they stay at 128 (split-brain: 528 kernel vs
+                # 128 bucketing), causing "not warmed-up" recompilations and
+                # non-deterministic tool-calling output.
+                # GDN hybrids (e.g. Qwen3.5) are intentionally left untouched:
+                # their KV-manager block_size is inflated (e.g. 1152) but the
+                # HPU kernel operates at 128-token granularity via virtual
+                # block splitting, so self.block_size must stay at 128.
+                self.block_size = self.vllm_config.cache_config.block_size
+                if self.enable_bucketing:
+                    self.bucketing_manager.block_size = self.block_size
             maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
 
@@ -6641,7 +6698,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self,
         sampled_token_ids: list[list[int]],
     ) -> list[list[int]]:
+        # vLLM PR #32374 (Dynamic SD) added a leading num_speculative_tokens
+        # positional arg to NgramProposer.propose(). Pass the statically
+        # configured count to match the new signature.
+        num_speculative_tokens = self.speculative_config.num_speculative_tokens
         draft_token_ids = self.drafter.propose(
+            num_speculative_tokens,
             sampled_token_ids,
             self.input_batch.num_tokens_no_spec,
             self.input_batch.token_ids_cpu,
@@ -6748,6 +6810,36 @@ class TensorTuple(tuple):
     def dtype(self):
         """Returns the torch.dtype of the tensors within the tuple."""
         return self._dtype
+
+    def _first_tensor(self) -> torch.Tensor:
+        """Return the first contained torch.Tensor.
+
+        Raises:
+            ValueError: If the tuple holds no tensors.
+        """
+        for item in self:
+            if isinstance(item, torch.Tensor):
+                return item
+        raise ValueError("TensorTuple contains no torch.Tensor")
+
+    def untyped_storage(self):
+        """Delegate to the first contained tensor's untyped storage.
+
+        Upstream NIXL ``register_kv_caches`` (vLLM #44577) probes each cache
+        value with ``untyped_storage()``/``data_ptr()`` to detect DSv4-style
+        packed allocations. HPU returns a :class:`TensorTuple` of (K, V) per
+        layer; each layer is independently allocated, so exposing the first
+        tensor's storage yields distinct per-layer storage pointers and makes
+        the packed-path detection fall through to regular registration.
+        """
+        return self._first_tensor().untyped_storage()
+
+    def data_ptr(self) -> int:
+        """Delegate to the first contained tensor's data pointer.
+
+        See :meth:`untyped_storage` for why this is needed.
+        """
+        return self._first_tensor().data_ptr()
 
 
 class HPUAttentionMetadataProcessor:

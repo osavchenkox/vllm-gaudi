@@ -25,11 +25,12 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
+from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner, _GDN_MAMBA_TYPES
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -199,6 +200,7 @@ class HPUWorker(WorkerBase):
                     "kv_cache_config": self.kv_cache_config,
                 }
                 self.model_runner = None
+                HPUBucketingManager.deactivate()
             # Preserve previous KV cache metadata in stash for rollback.
             self.model_sleeping = False
             self.kv_cache_sleeping = False
@@ -285,6 +287,10 @@ class HPUWorker(WorkerBase):
 
         self.model_runner = self._model_runner_stash.pop(stash_key)
         stashed_state = self._model_runner_state_stash.pop(stash_key, {})
+
+        bucketing_manager = getattr(self.model_runner, "bucketing_manager", None)
+        if bucketing_manager is not None:
+            bucketing_manager.activate()
 
         restored_config = stashed_state.get("vllm_config", getattr(self.model_runner, "vllm_config", target_config))
         self._apply_vllm_config(restored_config)
@@ -604,8 +610,13 @@ class HPUWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
 
+        # Upstream now consumes handshake metadata via
+        # set_xfer_handshake_metadata_pp_aware(), which expects keys to be
+        # (pp_rank, tp_rank) tuples. Returning a flat {tp_rank: metadata} dict
+        # made it unpack an int and raise TypeError during EngineCore init.
+        pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
-        return {tp_rank: metadata}
+        return {(pp_rank, tp_rank): metadata}
 
     def get_hpu_used_memory_mb(self) -> float | None:
         """Return currently used HPU memory in MB for this worker."""
