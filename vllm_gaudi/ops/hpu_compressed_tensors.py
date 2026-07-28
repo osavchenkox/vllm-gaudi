@@ -932,6 +932,37 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
 
         return torch.stack(outputs, dim=0)
 
+    def _requantize_int4_blockwise(self, weight_packed: torch.Tensor, weight_scale: torch.Tensor,
+                                   zero_point: torch.Tensor, g_idx) -> tuple:
+        """Rebuild (packed_int32, scale_bf16) in the layout
+        hpu::mixture_of_experts.int4_*_blockwise expects: weight packed 8-nibbles/int32
+        low-nibble-first along the last (input) dim, shape (rows, cols/8); scale bf16
+        unpacked, shape (rows, cols/group_size) matching the weight's own (rows, cols).
+
+        The existing checkpoint packing/transpose (gptq_hpu_moe_repack, scale transpose)
+        is tailored to the Marlin convert_from_uint4 dequant-all-experts path and its
+        exact orientation is not guaranteed to match the new op's contract, so instead
+        of reusing it we dequantize once via the already-validated convert_from_uint4
+        path and requantize fresh into a clean signed-int4, group_size=self.group_size,
+        no-zero-point (symmetric) layout. This model's quant config has
+        symmetric=true/actorder=null, so no zero-point/group_index is needed.
+        """
+        dequant = torch.ops.hpu.convert_from_uint4(weight_packed, weight_scale, zero_point, weight_scale.dtype,
+                                                    g_idx).to(torch.float32)
+        rows, cols = dequant.shape
+        num_groups = cols // self.group_size
+        grouped = dequant.view(rows, num_groups, self.group_size)
+        amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        scale = amax / 7.0
+        q = torch.clamp(torch.round(grouped / scale), -8, 7).to(torch.int32)
+        scale = scale.squeeze(-1).to(torch.bfloat16).contiguous()
+        q = q.view(rows, cols)
+        q_nibbles = (q & 0xF).view(rows, cols // 8, 8)
+        packed = torch.zeros((rows, cols // 8), dtype=torch.int32, device=q.device)
+        for i in range(8):
+            packed |= q_nibbles[:, :, i] << (4 * i)
+        return packed.contiguous(), scale
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Reconfigure packed weights and scales to match moe_wna16 format
         w13_weight_packed = self.gptq_hpu_moe_repack(layer.w13_weight_packed)
@@ -954,18 +985,54 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
             num_experts,
             experts_min,
             experts_max,
+            group_size=self.group_size,
+            is_signed=True,
         )
-        for expert_id in range(layer.local_num_experts):
-            layer.moe_op.w13_list[expert_id].set_weight_packed(layer.w13_weight_packed.data[expert_id])
-            layer.moe_op.w2_list[expert_id].set_weight_packed(layer.w2_weight_packed.data[expert_id])
-            layer.moe_op.w13_list[expert_id].set_weight_scale(layer.w13_weight_scale.data[expert_id])
-            layer.moe_op.w2_list[expert_id].set_weight_scale(layer.w2_weight_scale.data[expert_id])
-            layer.moe_op.w13_list[expert_id].set_zero_point(layer.w13_zero_point.data)
-            layer.moe_op.w2_list[expert_id].set_zero_point(layer.w2_zero_point.data)
+        if layer.moe_op.use_blockwise:
+            # The blockwise op fully replaces the Marlin dequant-all-experts path for
+            # this layer. Requantize into the blockwise tensors, then overwrite (not
+            # add to) the existing Marlin-format parameters with tiny placeholders --
+            # generic vLLM bookkeeping (RoutedExperts._ensure_moe_quant_config_init ->
+            # get_fused_moe_quant_config) unconditionally reads layer.w13_weight_scale/
+            # w2_weight_scale on this code path even though the HPU moe_op doesn't use
+            # them, so the attributes must stay present. Keeping both the full-size
+            # Marlin tensors AND the blockwise tensors live doubles per-expert weight
+            # memory across 60 MoE layers x 48 local experts and blows the device-memory
+            # budget the KV-cache sizing already computed against the single-copy
+            # footprint -- hence shrinking these to placeholders instead of `del`.
+            for expert_id in range(layer.local_num_experts):
+                w13_g_idx = layer.w13_weight_g_idx.data[expert_id] if self.actorder == "group" else None
+                w2_g_idx = layer.w2_weight_g_idx.data[expert_id] if self.actorder == "group" else None
+                w13_packed_bw, w13_scale_bw = self._requantize_int4_blockwise(
+                    layer.w13_weight_packed.data[expert_id], layer.w13_weight_scale.data[expert_id],
+                    layer.w13_zero_point.data, w13_g_idx)
+                w2_packed_bw, w2_scale_bw = self._requantize_int4_blockwise(
+                    layer.w2_weight_packed.data[expert_id], layer.w2_weight_scale.data[expert_id],
+                    layer.w2_zero_point.data, w2_g_idx)
+                layer.moe_op.w13_list[expert_id].set_weight_packed_blockwise(w13_packed_bw)
+                layer.moe_op.w2_list[expert_id].set_weight_packed_blockwise(w2_packed_bw)
+                layer.moe_op.w13_list[expert_id].set_weight_scale_blockwise(w13_scale_bw)
+                layer.moe_op.w2_list[expert_id].set_weight_scale_blockwise(w2_scale_bw)
+            placeholder_scale = torch.ones(1, 1, 1, dtype=layer.w13_weight_scale.dtype,
+                                           device=layer.w13_weight_scale.device)
+            placeholder_packed = torch.zeros(1, 1, 1, dtype=torch.int32, device=layer.w13_weight_packed.device)
+            layer.w13_weight_packed = torch.nn.Parameter(placeholder_packed, requires_grad=False)
+            layer.w2_weight_packed = torch.nn.Parameter(placeholder_packed.clone(), requires_grad=False)
+            layer.w13_weight_scale = torch.nn.Parameter(placeholder_scale, requires_grad=False)
+            layer.w2_weight_scale = torch.nn.Parameter(placeholder_scale.clone(), requires_grad=False)
+            del layer.w13_zero_point, layer.w2_zero_point
+        else:
+            for expert_id in range(layer.local_num_experts):
+                layer.moe_op.w13_list[expert_id].set_weight_packed(layer.w13_weight_packed.data[expert_id])
+                layer.moe_op.w2_list[expert_id].set_weight_packed(layer.w2_weight_packed.data[expert_id])
+                layer.moe_op.w13_list[expert_id].set_weight_scale(layer.w13_weight_scale.data[expert_id])
+                layer.moe_op.w2_list[expert_id].set_weight_scale(layer.w2_weight_scale.data[expert_id])
+                layer.moe_op.w13_list[expert_id].set_zero_point(layer.w13_zero_point.data)
+                layer.moe_op.w2_list[expert_id].set_zero_point(layer.w2_zero_point.data)
 
-            if self.actorder == "group":
-                layer.moe_op.w13_list[expert_id].set_g_idx(layer.w13_weight_g_idx.data[expert_id])
-                layer.moe_op.w2_list[expert_id].set_g_idx(layer.w2_weight_g_idx.data[expert_id])
+                if self.actorder == "group":
+                    layer.moe_op.w13_list[expert_id].set_g_idx(layer.w13_weight_g_idx.data[expert_id])
+                    layer.moe_op.w2_list[expert_id].set_g_idx(layer.w2_weight_g_idx.data[expert_id])
 
         htorch.core.mark_step()
 

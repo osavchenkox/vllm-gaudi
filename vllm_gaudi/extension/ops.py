@@ -1460,6 +1460,15 @@ class MoeWNA16Matmul(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.g_idx = None
+        # Raw (pre-repack) packed weight + per-group scale/zero-point, in the layout
+        # hpu::mixture_of_experts.int4_*_blockwise expects: int32-packed nibbles,
+        # low-nibble-first, shape (rows, cols/8); scale/zero-point bf16, unpacked,
+        # shape (rows, cols/group_size). Distinct from weight_packed/weight_scale
+        # above, which are repacked/transposed for the convert_from_uint4 (Marlin)
+        # dequant-all-experts path.
+        self.weight_packed_blockwise = None
+        self.weight_scale_blockwise = None
+        self.zero_point_blockwise = None
 
     def set_weight_packed(self, weight_packed: torch.Tensor):
         self.weight_packed = weight_packed
@@ -1473,6 +1482,15 @@ class MoeWNA16Matmul(torch.nn.Module):
     def set_g_idx(self, g_idx: torch.Tensor):
         self.g_idx = g_idx
 
+    def set_weight_packed_blockwise(self, weight_packed: torch.Tensor):
+        self.weight_packed_blockwise = weight_packed
+
+    def set_weight_scale_blockwise(self, weight_scale: torch.Tensor):
+        self.weight_scale_blockwise = weight_scale
+
+    def set_zero_point_blockwise(self, zero_point: torch.Tensor):
+        self.zero_point_blockwise = zero_point
+
     def get_dequant_weight(self):
         return torch.ops.hpu.convert_from_uint4(self.weight_packed, self.weight_scale, self.zero_point,
                                                 self.weight_scale.dtype, self.g_idx)
@@ -1484,7 +1502,12 @@ class MoeWNA16Matmul(torch.nn.Module):
 class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
     """ Mixture of Experts for compressed int4 WNA16 """
 
-    def __init__(self, num_experts: int, experts_min: int = 0, experts_max: int = 8):
+    def __init__(self,
+                 num_experts: int,
+                 experts_min: int = 0,
+                 experts_max: int = 8,
+                 group_size: int = -1,
+                 is_signed: bool = False):
         super().__init__()
         self.w13_list = torch.nn.ModuleList([MoeWNA16Matmul() for _ in range(num_experts)])
         self.w2_list = torch.nn.ModuleList([MoeWNA16Matmul() for _ in range(num_experts)])
@@ -1492,6 +1515,12 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
         self.num_experts = num_experts
         self.experts_min = experts_min
         self.experts_max = experts_max
+        self.group_size = group_size
+        self.is_signed = is_signed
+        # Only the routed/selected experts need dequantizing on this path (kernel-side
+        # blockwise dequant), instead of every locally-assigned expert on every forward.
+        self.use_blockwise = group_size > 0 and hasattr(torch.ops.hpu.mixture_of_experts,
+                                                         'int4_fused_weights_blockwise')
         if MAX_EXPERTS_PER_SLICE > 0:
             max_expert_per_slice = MAX_EXPERTS_PER_SLICE
         else:
@@ -1499,6 +1528,34 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
         self.moe_n_slice = 1 if self.num_experts <= max_expert_per_slice \
                 else self.num_experts // max_expert_per_slice
         self.num_expert_per_group = self.num_experts // self.moe_n_slice
+
+    def _blockwise_forward(self, x, topk_ids, topk_weights, permuted_weights, activation, experts_min, experts_max,
+                           w13_slice, w2_slice):
+        # Requantized fresh (contiguous groups, no activation reordering), so no
+        # group_index is passed regardless of the original checkpoint's g_idx.
+        zero_point_w12 = [m.zero_point_blockwise for m in w13_slice] \
+            if w13_slice[0].zero_point_blockwise is not None else None
+        zero_point_w3 = [m.zero_point_blockwise for m in w2_slice] \
+            if w2_slice[0].zero_point_blockwise is not None else None
+        return torch.ops.hpu.mixture_of_experts.int4_fused_weights_blockwise(
+            hidden_states=x,
+            expert_routing_table=topk_ids,
+            router_weights=topk_weights,
+            w12=[m.weight_packed_blockwise for m in w13_slice],
+            w3=[m.weight_packed_blockwise for m in w2_slice],
+            d_scale_w12=[m.weight_scale_blockwise for m in w13_slice],
+            d_scale_w3=[m.weight_scale_blockwise for m in w2_slice],
+            zero_point_w12=zero_point_w12,
+            zero_point_w3=zero_point_w3,
+            group_index_w12=None,
+            group_index_w3=None,
+            block_size=self.group_size,
+            permuted_weights=permuted_weights,
+            activation=activation,
+            experts_min=experts_min,
+            experts_max=experts_max,
+            is_signed=self.is_signed,
+        )
 
     def forward(
         self,
@@ -1509,6 +1566,25 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
         activation="silu",
     ):
         activation = _as_activation_str(activation)
+
+        if self.use_blockwise:
+            if self.moe_n_slice == 1:
+                return self._blockwise_forward(x, topk_ids, topk_weights, permuted_weights, activation,
+                                               self.experts_min, self.experts_max, self.w13_list, self.w2_list)
+            final_hidden_states = None
+            for i in range(self.moe_n_slice):
+                w13_slice = self.w13_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+                w2_slice = self.w2_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+                min_expert = self.experts_min + i * self.num_expert_per_group
+                max_expert = min_expert + self.num_expert_per_group - 1
+                slice_final_hidden_states = self._blockwise_forward(x, topk_ids, topk_weights, permuted_weights,
+                                                                    activation, min_expert, max_expert, w13_slice,
+                                                                    w2_slice)
+                htorch.core.mark_step()
+                final_hidden_states = slice_final_hidden_states if final_hidden_states is None \
+                    else final_hidden_states + slice_final_hidden_states
+            return final_hidden_states
+
         w13_list = []
         w2_list = []
         for j in range(self.num_experts):
