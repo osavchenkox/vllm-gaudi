@@ -936,8 +936,19 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
                                    zero_point: torch.Tensor, g_idx) -> tuple:
         """Rebuild (packed_int32, scale_bf16) in the layout
         hpu::mixture_of_experts.int4_*_blockwise expects: weight packed 8-nibbles/int32
-        low-nibble-first along the last (input) dim, shape (rows, cols/8); scale bf16
-        unpacked, shape (rows, cols/group_size) matching the weight's own (rows, cols).
+        low-nibble-first along the last dim, shape (rows, cols/8); scale bf16 unpacked,
+        shape (rows/group_size, cols).
+
+        Axis note (this was wrong before): after gptq_hpu_moe_repack + the scale
+        transpose, convert_from_uint4 hands us the weight as (K, N) -- rows are the
+        input/reduction dim, columns are the output channels -- and the checkpoint
+        groups along K (per expert: weight_packed [2048, 896] with weight_scale
+        [2048, 224], i.e. 7168 int4 along the packed axis against 224 groups). The
+        earlier version grouped along `cols`, i.e. over 32 *output* channels for a
+        fixed input index, which is neither the checkpoint's quantization axis nor a
+        GEMM-friendly one. Grouping along rows keeps the original semantics and puts
+        the group axis on synapse dim1, which is the orientation the fused
+        grouped_transpose_dequant kernel reads natively.
 
         The existing checkpoint packing/transpose (gptq_hpu_moe_repack, scale transpose)
         is tailored to the Marlin convert_from_uint4 dequant-all-experts path and its
@@ -950,12 +961,12 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
         dequant = torch.ops.hpu.convert_from_uint4(weight_packed, weight_scale, zero_point, weight_scale.dtype,
                                                    g_idx).to(torch.float32)
         rows, cols = dequant.shape
-        num_groups = cols // self.group_size
-        grouped = dequant.view(rows, num_groups, self.group_size)
-        amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        num_groups = rows // self.group_size
+        grouped = dequant.view(num_groups, self.group_size, cols)
+        amax = grouped.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
         scale = amax / 7.0
         q = torch.clamp(torch.round(grouped / scale), -8, 7).to(torch.int32)
-        scale = scale.squeeze(-1).to(torch.bfloat16).contiguous()
+        scale = scale.squeeze(1).to(torch.bfloat16).contiguous()
         q = q.view(rows, cols)
         q_nibbles = (q & 0xF).view(rows, cols // 8, 8)
         packed = torch.zeros((rows, cols // 8), dtype=torch.int32, device=q.device)
