@@ -1057,6 +1057,21 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
             topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
             topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
+
+        if layer.moe_config.is_sequence_parallel:
+            # Same fixup as HPUCompressedTensorsW8A8Fp8MoEMethod.apply_monolithic,
+            # which the WNA16 path was missing. At dp_size == 1 with TP>1 + EP
+            # (allgather_reducescatter backend => use_sequence_parallel_moe),
+            # MoERunner._maybe_combine reduce-scatters the expert output over the
+            # EP group, but the paired dispatch all-gather is wired only for
+            # dp_size > 1. Unpaired, the combine divides the token count by
+            # ep_size and every rank dies in hpu_communicator.combine() with
+            # "input tensor must be the same size as output size times world
+            # size". All-gather the inputs here to restore the symmetry.
+            x = dispatch_tensor(x, None, is_sequence_parallel=True)
+            topk_ids = dispatch_tensor(topk_ids, None, is_sequence_parallel=True)
+            topk_weights = dispatch_tensor(topk_weights, None, is_sequence_parallel=True)
+
         topk_ids = topk_ids.view(*x.shape[:-1], -1)
         topk_weights = topk_weights.view(*x.shape[:-1], -1)
 
@@ -1067,6 +1082,10 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
             permuted_weights=False,
             activation=_normalize_moe_activation(layer.activation),
         )
+        if layer.moe_config.is_sequence_parallel:
+            # The reduce-scatter shrank dim 0 to input_shape[0] / ep_size, so the
+            # original leading dim no longer applies.
+            return output.view(*(output.size(0), *input_shape[1:]))
         return output.view(*input_shape)
 
 
