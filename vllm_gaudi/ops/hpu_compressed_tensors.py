@@ -948,7 +948,7 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
         symmetric=true/actorder=null, so no zero-point/group_index is needed.
         """
         dequant = torch.ops.hpu.convert_from_uint4(weight_packed, weight_scale, zero_point, weight_scale.dtype,
-                                                    g_idx).to(torch.float32)
+                                                   g_idx).to(torch.float32)
         rows, cols = dequant.shape
         num_groups = cols // self.group_size
         grouped = dequant.view(rows, num_groups, self.group_size)
@@ -1003,17 +1003,20 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
             for expert_id in range(layer.local_num_experts):
                 w13_g_idx = layer.w13_weight_g_idx.data[expert_id] if self.actorder == "group" else None
                 w2_g_idx = layer.w2_weight_g_idx.data[expert_id] if self.actorder == "group" else None
-                w13_packed_bw, w13_scale_bw = self._requantize_int4_blockwise(
-                    layer.w13_weight_packed.data[expert_id], layer.w13_weight_scale.data[expert_id],
-                    layer.w13_zero_point.data, w13_g_idx)
-                w2_packed_bw, w2_scale_bw = self._requantize_int4_blockwise(
-                    layer.w2_weight_packed.data[expert_id], layer.w2_weight_scale.data[expert_id],
-                    layer.w2_zero_point.data, w2_g_idx)
+                w13_packed_bw, w13_scale_bw = self._requantize_int4_blockwise(layer.w13_weight_packed.data[expert_id],
+                                                                              layer.w13_weight_scale.data[expert_id],
+                                                                              layer.w13_zero_point.data, w13_g_idx)
+                w2_packed_bw, w2_scale_bw = self._requantize_int4_blockwise(layer.w2_weight_packed.data[expert_id],
+                                                                            layer.w2_weight_scale.data[expert_id],
+                                                                            layer.w2_zero_point.data, w2_g_idx)
                 layer.moe_op.w13_list[expert_id].set_weight_packed_blockwise(w13_packed_bw)
                 layer.moe_op.w2_list[expert_id].set_weight_packed_blockwise(w2_packed_bw)
                 layer.moe_op.w13_list[expert_id].set_weight_scale_blockwise(w13_scale_bw)
                 layer.moe_op.w2_list[expert_id].set_weight_scale_blockwise(w2_scale_bw)
-            placeholder_scale = torch.ones(1, 1, 1, dtype=layer.w13_weight_scale.dtype,
+            placeholder_scale = torch.ones(1,
+                                           1,
+                                           1,
+                                           dtype=layer.w13_weight_scale.dtype,
                                            device=layer.w13_weight_scale.device)
             placeholder_packed = torch.zeros(1, 1, 1, dtype=torch.int32, device=layer.w13_weight_packed.device)
             layer.w13_weight_packed = torch.nn.Parameter(placeholder_packed, requires_grad=False)
