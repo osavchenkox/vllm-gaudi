@@ -371,6 +371,20 @@ class HPUMambaMixer2(MambaMixer2):
     # Called from apply_model_specific_patches() in hpu_model_runner.
     # ------------------------------------------------------------------
     def _init_split_weights(self):
+        # dt_bias and D are constants, but the decode path used to broadcast them
+        # to (nheads, head_dim) on every step of every layer: measured 0.31 ms of
+        # the 15.1 ms device time of a Nemotron-3-Ultra decode step, in MME
+        # transposes plus broadcast_non_fcd. Materialise them once here instead
+        # (2 x nheads x head_dim elements per layer). Must stay above the
+        # quantized early return below, which this model takes.
+        # Non-persistent buffers, same convention as conv_weights/_states_weight.
+        self.register_buffer("_dt_bias_expanded",
+                             self.dt_bias[:, None, ...].expand(-1, self.head_dim).contiguous(),
+                             persistent=False)
+        self.register_buffer("_D_expanded",
+                             self.D[:, None, ...].expand(-1, self.head_dim).contiguous(),
+                             persistent=False)
+
         # The split-GEMM optimization slices the raw in_proj weight and calls
         # a plain F.linear, which is only valid for an unquantized weight whose
         # logical layout is [out, hidden]. For a quantized in_proj (e.g. FP8
@@ -530,8 +544,15 @@ class HPUMambaMixer2(MambaMixer2):
             n_groups = self.n_groups // self.tp_size
             A_d = self.A.to(dtype=torch.float32)  # (nheads,) — keep compact, no expand
             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
-            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
-            D_d = self.D[:, None, ...].expand(-1, self.head_dim)
+            # Pre-materialised in _init_split_weights (see the note there); the
+            # inline expand is kept as a fallback for callers that never run the
+            # post-load hook.
+            dt_bias = getattr(self, "_dt_bias_expanded", None)
+            if dt_bias is None:
+                dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+            D_d = getattr(self, "_D_expanded", None)
+            if D_d is None:
+                D_d = self.D[:, None, ...].expand(-1, self.head_dim)
             B_d = B_d.view(-1, n_groups, B_d.shape[1] // n_groups)
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(-1, self.num_heads // self.tp_size, self.head_dim)
