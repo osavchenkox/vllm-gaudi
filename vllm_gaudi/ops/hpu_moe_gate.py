@@ -34,12 +34,18 @@ agreement (0.635) that sits between two runs of the unmodified stack
 (0.630 / 0.665).  It is opt-in rather than the default because MiniMax-M2/M2.5/M3
 reach this path too and were **not** measured.
 
+``bf16`` is 2.5x faster again on the gate (measured 0.43 ms/step against fp16's
+1.08 and fp32's 2.05) but **failed the same accuracy gate**: gsm8k_platinum drops
+0.9750 -> 0.9700 and one prompt that fp16 answers correctly instead collapses into
+a verbatim repetition loop of the question, emitting no answer at all.  That is
+consistent with bf16 perturbing 20x more routing decisions.  Treat bf16 as a
+throughput-only option for a caller who has re-run their own accuracy suite.
+
 Note on the dtypes: fp16 keeps 10 mantissa bits but only a 5-bit exponent, so
 unlike bf16 it can overflow on an outlier gate input.  It is safe on Nemotron
 because the gate consumes a post-RMSNorm hidden state and the logits are
 ~N(0, 1.8) by construction (weight ~0.02, K=8192); do not enable fp16 for a gate
-whose input is not normalised without re-checking.  bf16 is range-safe and 2.6x
-faster still, but perturbs 20x more routing decisions.
+whose input is not normalised without re-checking.
 
 The fidelity column isolates GEMM *output* rounding, because the weight itself is
 exact in every row (bf16 -> fp16 is lossless at these magnitudes).  No
