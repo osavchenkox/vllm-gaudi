@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER: bool = False
     VLLM_HPU_MOE_GATHER_RATIO: float = 0.4
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
+    VLLM_HPU_MOE_GATE_DTYPE: str = "fp32"
     VLLM_COMPACT_GDN: bool = False
 
 # The begin-* and end* here are used by the documentation generator
@@ -109,6 +110,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: float(os.environ.get("VLLM_HPU_MOE_GATHER_RATIO", "0.4")),
     "VLLM_HPU_MOE_GATHER_VERIFY":
     lambda: os.environ.get("VLLM_HPU_MOE_GATHER_VERIFY", "0").lower() in ("1", "true"),
+
+    # Storage/compute dtype of an MoE router gate that asked for fp32 compute:
+    # fp32 | fp16 | bf16. See ops/hpu_moe_gate.py for the measured speed and the
+    # routing fidelity of each. Default fp32 keeps upstream behaviour; fp16 is
+    # opt-in because the win is only validated on Nemotron-3-Ultra-550B.
+    "VLLM_HPU_MOE_GATE_DTYPE":
+    lambda: os.environ.get("VLLM_HPU_MOE_GATE_DTYPE", "fp32").strip().lower(),
 
     # Use the compact recurrent-state (conv/ssm) layout for gated delta net
     # models. The model runner auto-detects and sets this during init, so read

@@ -32,6 +32,7 @@ This document lists the supported diagnostic and profiling, as well as performan
 | `VLLM_MINIMAX_M3_MOE_TOKEN_TILE` | Maximum number of tokens processed per tile by the MiniMax-M3 dense SwiGLU-OAI expert path. Non-positive values disable tiling. | `512` |
 | `VLLM_MINIMAX_M3_MOE_DECODE_GATHER` | Enables the MiniMax-M3 routed-expert gather path for low-token decode. Set to `0` or `false` to use the dense expert path. | `true` |
 | `VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS` | Maximum token count for the MiniMax-M3 routed-expert gather path. Larger batches use the dense expert path. | `16` |
+| `VLLM_HPU_MOE_GATE_DTYPE`    | Storage and compute dtype (`fp32`, `fp16` or `bf16`) of an MoE router gate that requested fp32 compute, such as Nemotron-H / Nemotron-3 and MiniMax-M2. The fp32 request only exists to reach CUDA-specialised router kernels, so on HPU it upcasts the checkpoint weight for nothing: on Nemotron-3-Ultra-550B the fp32 gate GEMM costs 2.05 ms of a 15.13 ms decode step, `fp16` halves that at 99.5% top-22 expert-set fidelity and `bf16` cuts it 5x at 94.9%. The default keeps upstream behaviour bit-exactly. | `fp32` |
 
 ## Experimental: Custom FP8 MoE Gather Combine
 
